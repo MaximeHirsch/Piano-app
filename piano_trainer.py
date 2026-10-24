@@ -8,6 +8,10 @@ Piano Trainer — apprends tes morceaux avec la notation anglo-saxonne.
   accord tant que tu ne l'as pas joué(e).
 - Joue avec un VRAI PIANO : l'appli t'écoute au micro et reconnaît les notes / accords attendus.
   (Le clavier de l'ordinateur, la souris et un clavier MIDI marchent aussi.)
+- Choisis la taille de TON clavier : le morceau est transposé (en octaves) et les notes qui
+  dépasseraient encore sont ramenées dans ta tessiture, pour que tout soit jouable.
+- Tolérance sur les accords : on peut continuer même si seulement 2 notes sur 3 sont reconnues.
+  Et « Passer » (bouton ou flèche →) saute une étape si vraiment ça ne passe pas.
 
 Dépendances :
   pip install pygame                 (son + MIDI, optionnel)
@@ -50,7 +54,25 @@ BLACK = {1, 3, 6, 8, 10}
 
 # Touches du clavier d'ordinateur : demi-tons 0, 1, 2, ... à partir du Do de l'octave choisie
 PC_KEYS = 'awsedftgyhujkolpm'
-CHORD_WINDOW = 0.6   # secondes max entre la 1re et la dernière note d'un accord
+CHORD_WINDOW = 0.6    # secondes max entre la 1re et la dernière note d'un accord
+PARTIAL_GRACE = 0.5   # en mode tolérant : on laisse 0,5 s pour que les notes manquantes arrivent
+
+# Tolérance sur les accords : nom affiché -> mode
+TOLERANCES = {
+    'Strict : toutes les notes': 0,
+    'Souple : toutes sauf 1 (accords de 3+ notes)': 1,
+    'Très souple : au moins la moitié des notes': 2,
+}
+
+# Tessiture des claviers (numéros MIDI, Do central = 60). Un clavier 61 touches sonne de C2 à C7.
+KEYBOARDS = {
+    '25 touches (2 octaves)': (48, 72),
+    '37 touches (3 octaves)': (48, 84),
+    '49 touches (4 octaves)': (36, 84),
+    '61 touches (5 octaves)': (36, 96),
+    '76 touches': (28, 103),
+    '88 touches (piano)': (21, 108),
+}
 
 
 # --------------------------------------------------------------------------- notes
@@ -193,34 +215,117 @@ def make_wav(midi, seconds=1.4):
 class MicListener:
     """Écoute le micro et vérifie quelles notes ATTENDUES viennent d'être jouées.
 
-    On ne retranscrit pas tout à l'aveugle : pour chaque note attendue on mesure l'énergie
-    à sa fréquence fondamentale (FFT), puis on exige une *attaque* (hausse nette par rapport
-    aux ~0,9 s précédentes) pour ne pas valider une note encore en train de résonner.
+    Principe : un piano n'émet pas qu'une fréquence par note, mais une fondamentale + des
+    harmoniques (×2, ×3, ×4…). On modélise chaque touche par son « peigne » d'harmoniques, puis
+    on décompose le son entendu en somme de touches (moindres carrés non négatifs).
+    Une *attaque* (hausse nette d'énergie) est exigée pour ne pas valider une note qui résonne encore.
+
+    Robustesse au bruit grave (ventilateur, souffle, vibrations du micro d'ordinateur) :
+      1. PLANCHER LOCAL : chaque pic est comparé au bruit de SA zone de fréquences (±4 demi-tons),
+         et non à un bruit global. Un micro de portable a beaucoup de bruit dans les graves : avec
+         un plancher global, ces graves ressemblaient à des « notes ».
+      2. PROFIL DE BRUIT : on suit le minimum récent de chaque pic (statistiques de minimum) et on le
+         retire. Un bruit continu disparaît, une frappe de piano (brève et forte) reste.
+      3. CANDIDATS RESTREINTS : on ne cherche que les notes de l'étape en cours, de la précédente et
+         de la suivante, plus leurs « confondeurs » (octaves, quintes, demi-tons voisins). Le bruit
+         ne peut donc plus s'attribuer à des touches qui n'ont rien à voir avec le morceau.
     """
     RATE = 44100
-    WIN = 12288            # ≈ 0,28 s d'analyse
-    NFFT = 32768
-    LO, HI = 21, 108       # A0 … C8
+    WIN = 16384            # ≈ 0,37 s d'analyse : assez fin pour séparer les graves
+    NFFT = 65536
+    GRID_LO = 21           # A0 : première case de la grille « demi-tons »
+    GRID_N = 92            # … jusqu'à ≈ 5 kHz
+    HARMS = (1, 2, 3, 4, 5, 6, 8)
+    HW = {1: 1.0, 2: 0.9, 3: 0.8, 4: 0.6, 5: 0.5, 6: 0.4, 8: 0.3}
+    NOISE_T = 6.0          # en dessous de 6× le bruit local, un pic est ignoré
+    FLOOR_SEMI = 4         # demi-largeur (en demi-tons) de la zone du plancher de bruit local
+    NOISE_RISE = 1.01      # le profil de bruit peut remonter de 1 % par analyse (≈ ×1,2 / s)
+    NOISE_SUB = 0.9        # part du profil de bruit retirée des pics
+    SPARSE = 1.0           # pénalité de parcimonie (évite les notes « fantômes »)
+    SWIN = 4096            # fenêtre courte (≈ 93 ms) : sert uniquement à repérer les ATTAQUES
+    SNFFT = 8192
+    ONSET_RATIO = 1.3      # hausse minimale d'énergie pour compter une nouvelle frappe
+    ONSET_HOLD = 0.5       # une frappe reste « valable » 0,5 s
+    BASS_W = (0.4, 0.9)    # poids (fondamentale, 2e harmonique) du modèle des graves (< C3)
+    BASS_REL = 0.3         # part minimale de la note la plus forte, pour les graves (< C3)
+    REL_CUT = 0.15         # idem pour les autres notes (assez bas pour laisser passer les accords)
+    THR_MIN = 2.0          # le seuil ne descend jamais sous cette valeur, même à sensibilité 10
+    CONFUSERS = (0, 12, -12, 24, -24, 19, -19, 7, -7, 1, -1, 2, -2)
 
-    def __init__(self):
+    def __init__(self, lo=36, hi=96):
         self.ring = np.zeros(self.RATE, dtype=np.float32)
         self.lock = threading.Lock()
         self.stream = None
         self.level = 0.0
         self.window = np.hanning(self.WIN).astype(np.float32)
         df = self.RATE / self.NFFT
-        self.ranges = []
-        for m in range(self.LO, self.HI + 1):
-            f = 440 * 2 ** ((m - 69) / 12)
-            a = max(1, int(f * 2 ** (-0.45 / 12) / df))
-            b = int(math.ceil(f * 2 ** (0.45 / 12) / df)) + 1
-            self.ranges.append((a, b))
-        self.lo_bin, self.hi_bin = int(60 / df), int(4200 / df)
-        self.hist = collections.deque(maxlen=60)
+        self.grid, self.floor_rng = [], []
+        for k in range(self.GRID_N):
+            f = 440 * 2 ** ((self.GRID_LO + k - 69) / 12)
+            a = max(1, int(f * 2 ** (-0.5 / 12) / df))
+            b = max(a + 1, int(math.ceil(f * 2 ** (0.5 / 12) / df)) + 1)
+            self.grid.append((a, b))
+            fa = max(1, int(f * 2 ** (-self.FLOOR_SEMI / 12) / df))
+            fb = min(self.NFFT // 2, int(f * 2 ** (self.FLOOR_SEMI / 12) / df) + 1)
+            if fb - fa < 24:
+                fb = min(self.NFFT // 2, fa + 24)
+            self.floor_rng.append((fa, fb))
+        self.noise_prof = None
+        self.swindow = np.hanning(self.SWIN).astype(np.float32)
+        self.hist = collections.deque(maxlen=80)
+        self.set_range(lo, hi)
+
+    def set_range(self, lo, hi):
+        """Notes possibles = touches du clavier (on ne cherche pas ce qu'on ne peut pas jouer)."""
+        self.lo, self.hi = max(self.GRID_LO, int(lo)), min(108, int(hi))
+        m_count = self.hi - self.lo + 1
+        A = np.zeros((self.GRID_N, m_count))
+        for j, m in enumerate(range(self.lo, self.hi + 1)):
+            for h in self.HARMS:
+                k = m + int(round(12 * math.log2(h))) - self.GRID_LO
+                if k >= self.GRID_N:
+                    continue
+                w = self.HW[h]
+                if m < 48 and h in (1, 2):    # graves : fondamentale faible (petits haut-parleurs) et peu précise
+                    w = self.BASS_W[h - 1]
+                A[k, j] += w
+        self.A = A
+        # bandes (±½ ton) des 6 premières harmoniques de chaque touche, pour repérer les attaques
+        sdf = self.RATE / self.SNFFT
+        idx, wts = [], []
+        for m in range(self.lo, self.hi + 1):
+            f0 = 440 * 2 ** ((m - 69) / 12)
+            for h in range(1, 7):
+                f = f0 * h
+                if f > 5500:
+                    idx += [1, 2]
+                    wts.append(0.0)
+                    continue
+                a = max(1, int(f * 2 ** (-0.5 / 12) / sdf))
+                b = max(a + 1, int(math.ceil(f * 2 ** (0.5 / 12) / sdf)) + 1)
+                idx += [a, b]
+                wts.append(1.0 / h ** 0.5)
+        self.o_idx = np.array(idx)
+        self.o_w = np.array(wts).reshape(m_count, 6)
+        self.onset_t = np.full(m_count, -1e9)
+        self.prev_jump = np.zeros(m_count, dtype=bool)
+        self.noise_prof = None
+        self.hist.clear()
+
+    def mask_for(self, notes):
+        """Touches à examiner : les notes données + leurs « confondeurs » (octaves, quintes, voisines)."""
+        m = np.zeros(self.hi - self.lo + 1, dtype=bool)
+        for n in notes:
+            for d in self.CONFUSERS:
+                k = n + d - self.lo
+                if 0 <= k < len(m):
+                    m[k] = True
+        return m
 
     # -- flux audio
     def start(self, device=None):
         self.stop()
+        self.noise_prof = None
         self.stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype='float32',
                                      device=device, blocksize=1024, callback=self._callback)
         self.stream.start()
@@ -242,51 +347,105 @@ class MicListener:
             self.ring[-len(x):] = x
 
     # -- analyse
-    def analyze(self, samples=None):
-        """Force de chaque note (A0…C8), en multiples du bruit de fond du spectre."""
+    def analyze(self, samples=None, mask=None):
+        """Retourne la « force » de chaque touche du clavier (vecteur de lo…hi, 0 hors candidats)."""
         if samples is None:
             with self.lock:
                 samples = self.ring[-self.WIN:].copy()
         self.level = float(np.sqrt(np.mean(samples ** 2)))
-        if self.level < 0.002:                       # silence
-            return np.zeros(self.HI - self.LO + 1)
-        spec = np.abs(np.fft.rfft(samples * self.window, self.NFFT))
-        floor = float(np.median(spec[self.lo_bin:self.hi_bin])) + 1e-9
-        return np.array([spec[a:b].max() for a, b in self.ranges]) / floor
+        count = self.hi - self.lo + 1
+        if self.level < 0.0008:                      # silence
+            return np.zeros(count)
+        spec = np.abs(np.fft.rfft((samples - samples.mean()) * self.window, self.NFFT))
+        # 1) plancher de bruit LOCAL (médiane de la zone autour de chaque demi-ton)
+        floors = np.array([np.median(spec[a:b]) for a, b in self.floor_rng]) + 1e-9
+        peaks = np.array([spec[a:b].max() for a, b in self.grid]) / floors
+        # 2) profil de bruit : minimum récent de chaque pic (bruit continu = reste bas, frappe = pic bref)
+        if self.noise_prof is None:
+            self.noise_prof = peaks.copy()
+        else:
+            self.noise_prof = np.minimum(self.noise_prof * self.NOISE_RISE, peaks)
+        y = np.sqrt(np.maximum(peaks - self.NOISE_T - self.NOISE_SUB * self.noise_prof, 0.0))
+        if not y.any():
+            return np.zeros(count)
+        # 3) uniquement les touches candidates
+        if mask is None:
+            idx = np.arange(count)
+        else:
+            idx = np.nonzero(mask)[0]
+        if not len(idx):
+            return np.zeros(count)
+        A = self.A[:, idx]
+        AtA = A.T @ A
+        aty = A.T @ y
+        x = np.ones(len(idx))
+        for _ in range(120):                          # moindres carrés non négatifs (mises à jour multiplicatives)
+            x *= aty / (AtA @ x + self.SPARSE)
+        full = np.zeros(count)
+        full[idx] = x
+        return full
 
-    def update(self, required, sens, now, samples=None):
-        """Retourne (notes attendues entendues, note la plus grave audible ou None)."""
-        P = self.analyze(samples)
-        self.hist.append((now, P))
-        thr = 80.0 / max(1, sens)                    # sensibilité 5 → seuil 16
-        gmax = float(P.max())
+    def onset_energy(self, samples):
+        """Énergie courte durée dans les harmoniques de chaque touche + niveau de bruit."""
+        short = samples[-self.SWIN:]
+        if len(short) < self.SWIN:
+            short = np.concatenate([np.zeros(self.SWIN - len(short), dtype=np.float32), short])
+        mag = np.abs(np.fft.rfft((short - short.mean()) * self.swindow, self.SNFFT))
+        mx = np.maximum.reduceat(mag, self.o_idx)[::2].reshape(-1, 6)
+        noise = float(np.median(mag[10:1000])) + 1e-9
+        return (mx * self.o_w).sum(axis=1), 2.0 * noise * float(self.o_w[0].sum())
+
+    def _thr(self, sens):
+        """Seuil de force : sensibilité 5 → 2,4 ; la sensibilité 10 ne descend plus sous THR_MIN."""
+        return max(self.THR_MIN, 12.0 / max(1, sens))
+
+    def _strong(self, X, j, sens, rel):
+        """La touche j est-elle assez forte (en absolu ET par rapport à la plus forte) ?"""
+        thr = self._thr(sens)
+        xmax = float(X.max()) if len(X) else 0.0
+        return xmax >= thr and X[j] >= max(thr, rel * xmax)
+
+    def decide(self, X, required, sens, now):
+        """(notes attendues entendues avec attaque, ensemble des notes audibles)."""
+        prev = [x for t, _o, x in self.hist if now - 0.13 <= t <= now - 0.04]
         heard = set()
         for n in required:
-            i = n - self.LO
-            if not 0 <= i < len(P):
+            j = n - self.lo
+            if not 0 <= j < len(X):
                 continue
-            s = P[i]
-            if s < thr or s < 0.1 * gmax:
-                continue
-            # un vrai pic dépasse nettement ses voisines (sinon c'est le « clac » d'une autre note)
-            if s < 4 * max(float(np.median(P[max(0, i - 6):i + 7])), 1.0):
-                continue
-            # harmonique d'une note plus grave (octave en dessous) ? on ne valide pas
-            if i >= 12 and (n - 12) not in required and P[i - 12] > 1.2 * s:
-                continue
-            past = [p[i] for t, p in self.hist if now - 0.3 <= t <= now - 0.1]
-            base = min(past) if past else 0.0
-            if s >= 1.6 * max(base, 1.0):            # attaque nette
+            # une octave au-dessus d'une note demandée : ses harmoniques se confondent avec celles du dessous
+            rel = (self.BASS_REL if n < 48 else self.REL_CUT) * (0.35 if (n - 12) in required else 1.0)
+            if (self._strong(X, j, sens, rel) and prev
+                    and all(self._strong(x, j, sens, rel) for x in prev)
+                    and now - self.onset_t[j] <= self.ONSET_HOLD):
                 heard.add(n)
-        guess = None
-        if gmax >= thr:
-            for i in range(len(P)):
-                left = P[i - 1] if i > 0 else 0
-                right = P[i + 1] if i < len(P) - 1 else 0
-                if P[i] >= 0.5 * gmax and P[i] >= left and P[i] >= right:
-                    guess = i + self.LO
-                    break
-        return heard, guess
+        thr = self._thr(sens)
+        xmax = float(X.max()) if len(X) else 0.0
+        present = set()
+        if xmax >= thr:
+            present = {self.lo + int(j) for j in np.nonzero(X >= max(thr, self.REL_CUT * xmax))[0]}
+        return heard, present
+
+    def consume(self, notes):
+        """Une frappe validée ne doit pas valider la note suivante : on l'oublie."""
+        for n in notes:
+            j = n - self.lo
+            if 0 <= j < len(self.onset_t):
+                self.onset_t[j] = -1e9
+
+    def update(self, required, sens, now, samples=None, mask=None):
+        if samples is None:
+            with self.lock:
+                samples = self.ring[-self.WIN:].copy()
+        X = self.analyze(samples, mask)
+        O, floor_o = self.onset_energy(samples)
+        past = [o for t, o, _x in self.hist if now - 0.16 <= t <= now - 0.09]
+        base = np.min(past, axis=0) if past else np.zeros_like(O)
+        jump = (O >= self.ONSET_RATIO * np.maximum(base, floor_o))
+        self.onset_t[jump & ~self.prev_jump] = now      # front montant = nouvelle frappe
+        self.prev_jump = jump
+        self.hist.append((now, O, X))
+        return self.decide(X, required, sens, now)
 
 
 # --------------------------------------------------------------------------- application
@@ -296,16 +455,18 @@ class PianoTrainer(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Piano Trainer — notation anglo-saxonne')
-        self.geometry('1100x720')
-        self.minsize(800, 560)
+        self.geometry('1100x740')
+        self.minsize(800, 580)
 
-        self.events, self.onsets = [], []
+        self.src_events = []          # morceau tel qu'écrit dans la partition
+        self.events, self.onsets = [], []   # morceau adapté à ton clavier
         self.idx, self.pos = 0, 0.0
         self.playing = self.waiting = False
         self.wait_start = 0.0
+        self.partial_since = None     # moment où assez de notes (mais pas toutes) ont été reconnues
         self.recent, self.flash = {}, {}
         self.down, self._rel = set(), {}
-        self.range = (48, 84)
+        self.range = (36, 96)
         self._geom, self._top, self._kbh = {}, 0, 100
         self._shown = None
         self._sounds = {}
@@ -315,10 +476,14 @@ class PianoTrainer(tk.Tk):
         self.mic = None
         self.mic_clock = 0.0
         self.mic_guess = None
+        self.mic_present = set()
         self.mic_devices = []
         self.mic_on = tk.BooleanVar(value=False)
         self.mic_sens = tk.IntVar(value=5)
         self.mic_device = tk.StringVar(value='Micro par défaut')
+        self.kb_choice = tk.StringVar(value='61 touches (5 octaves)')
+        self.tol_choice = tk.StringVar(value=next(iter(TOLERANCES)))
+        self.shift = tk.IntVar(value=0)
         self.tempo = tk.IntVar(value=90)
         self.octave = tk.IntVar(value=4)
         self.wait_mode = tk.BooleanVar(value=True)
@@ -332,6 +497,7 @@ class PianoTrainer(tk.Tk):
         self.bind_all('<KeyPress>', self.on_key_press)
         self.bind_all('<KeyRelease>', self.on_key_release)
         self.bind_all('<space>', self.on_space)
+        self.bind_all('<Right>', self.on_skip_key)
         self.protocol('WM_DELETE_WINDOW', self.on_close)
         self.last = time.perf_counter()
         self.tick()
@@ -374,6 +540,18 @@ class PianoTrainer(tk.Tk):
         ttk.Checkbutton(top, text='Attendre la bonne note', variable=self.wait_mode,
                         takefocus=0).pack(side='left', padx=(20, 0))
 
+        kb_row = ttk.Frame(self, padding=(12, 0, 12, 4))
+        kb_row.pack(fill='x')
+        ttk.Label(kb_row, text='Mon clavier').pack(side='left')
+        kb_combo = ttk.Combobox(kb_row, textvariable=self.kb_choice, values=list(KEYBOARDS),
+                                state='readonly', width=24)
+        kb_combo.pack(side='left', padx=(6, 0))
+        kb_combo.bind('<<ComboboxSelected>>', lambda _e: (self.on_kb_change(), self.canvas.focus_set()))
+        ttk.Label(kb_row, text='Transposition (octaves)').pack(side='left', padx=(20, 4))
+        ttk.Spinbox(kb_row, from_=-4, to=4, textvariable=self.shift, width=3, state='readonly',
+                    command=self.on_shift_change).pack(side='left')
+        ttk.Button(kb_row, text='Auto', command=self.on_auto_shift, takefocus=0).pack(side='left', padx=(6, 0))
+
         mic_row = ttk.Frame(self, padding=(12, 0, 12, 4))
         mic_row.pack(fill='x')
         ttk.Checkbutton(mic_row, text='🎤 Jouer sur un vrai piano (écoute au micro)', variable=self.mic_on,
@@ -392,6 +570,15 @@ class PianoTrainer(tk.Tk):
                                  state='readonly', width=34)
             combo.pack(side='left', padx=(16, 0))
             combo.bind('<<ComboboxSelected>>', lambda _e: (self.toggle_mic(), self.canvas.focus_set()))
+
+        tol_row = ttk.Frame(self, padding=(12, 0, 12, 4))
+        tol_row.pack(fill='x')
+        ttk.Label(tol_row, text='Accords').pack(side='left')
+        tol_combo = ttk.Combobox(tol_row, textvariable=self.tol_choice, values=list(TOLERANCES),
+                                 state='readonly', width=42)
+        tol_combo.pack(side='left', padx=(6, 0))
+        tol_combo.bind('<<ComboboxSelected>>', lambda _e: (self.canvas.focus_set(), self.check_wait()))
+        ttk.Button(tol_row, text='⏭ Passer (→)', command=self.skip, takefocus=0).pack(side='left', padx=(20, 0))
 
         ttk.Label(self, textvariable=self.status, style='Status.TLabel', padding=(12, 0)).pack(anchor='w')
         self.big = ttk.Label(self, text='—', style='Big.TLabel')
@@ -453,6 +640,7 @@ class PianoTrainer(tk.Tk):
             if self.mic:
                 self.mic.stop()
             self.mic_guess = None
+            self.mic_present = set()
             self.status.set('Écoute micro désactivée.')
             return
         if np is None or sd is None:
@@ -463,10 +651,13 @@ class PianoTrainer(tk.Tk):
             return
         try:
             if self.mic is None:
-                self.mic = MicListener()
+                self.mic = MicListener(*self.kb_range())
+            else:
+                self.mic.set_range(*self.kb_range())
             device = next((i for i, name in self.mic_devices if name == self.mic_device.get()), None)
             self.mic.start(device)
-            self.status.set('🎤 Écoute du piano activée — joue les notes en vert (vérifie la barre de niveau).')
+            self.status.set('🎤 Écoute du piano activée — reste silencieux 1 s le temps de mesurer le bruit '
+                            'ambiant, puis joue les notes en vert.')
         except Exception as exc:
             self.mic_on.set(False)
             messagebox.showerror('Micro inaccessible', str(exc))
@@ -483,20 +674,41 @@ class PianoTrainer(tk.Tk):
         if now - self.mic_clock < 0.05:
             return
         self.mic_clock = now
-        required = set(self.events[self.idx]['notes']) if self.events and self.idx < len(self.events) else set()
+        have = bool(self.events) and self.idx < len(self.events)
+        required = set(self.events[self.idx]['notes']) if have else set()
+        # notes candidates : étape précédente (encore en train de sonner), courante et suivante
+        near, prev_notes = set(), set()
+        for k in (self.idx - 1, self.idx, self.idx + 1):
+            if 0 <= k < len(self.events):
+                near |= set(self.events[k]['notes'])
+        if 0 <= self.idx - 1 < len(self.events):
+            prev_notes = set(self.events[self.idx - 1]['notes'])
+        mask = self.mic.mask_for(near) if near else None
         try:
             sens = int(self.mic_sens.get())
         except (tk.TclError, ValueError):
             sens = 5
-        heard, guess = self.mic.update(required, sens, now)
-        if guess is not None:
-            self.flash[guess] = now
-        if self.playing and self.waiting:
-            for n in heard:
-                self.mark_heard(n)
-            if guess is not None and guess not in required and not heard and self.waiting:
-                self.status.set(f'J’entends ~{note_name(guess)} — attendu : '
-                                + ' + '.join(note_name(x) for x in sorted(required)))
+        heard, present = self.mic.update(required, sens, now, mask=mask)
+        self.mic_present = present
+        for n in present:                 # les touches entendues s'allument en bleu clair
+            self.flash[n] = now
+        if not (have and self.playing and self.wait_mode.get()):
+            return
+        # on accepte aussi une note jouée juste AVANT la ligne (0,35 s), pour ceux qui anticipent
+        ahead = (self.events[self.idx]['beat'] - self.pos) * 60 / self.get_tempo()
+        if not (self.waiting or ahead <= 0.35):
+            return
+        idx0 = self.idx
+        for n in heard:
+            if self.idx != idx0:
+                break
+            self.mark_heard(n)
+        if self.waiting and self.idx == idx0 and not heard:
+            related = {r + d for r in required for d in (12, -12, 24, -24, 19, -19)}   # harmoniques / octaves
+            wrong = present - required - prev_notes - related
+            if wrong:
+                self.status.set('J’entends ' + ' '.join(note_name(x) for x in sorted(wrong)[:4])
+                                + ' — attendu : ' + ' + '.join(note_name(x) for x in sorted(required)))
 
     def on_close(self):
         try:
@@ -530,24 +742,94 @@ class PianoTrainer(tk.Tk):
         self.set_song(*demo_song())
 
     def set_song(self, events, tempo):
-        self.events = events
+        self.src_events = events
         self.onsets = [e['beat'] for e in events]
-        notes = sorted(n for e in events for n in e['notes'])
-        lo, hi = notes[0] // 12 * 12, (notes[-1] // 12 + 1) * 12
-        if hi - lo < 24:
-            hi = lo + 24
-        self.range = (lo, hi)
         self.tempo.set(int(round(tempo)))
+        self.idx = 0
+        self.shift.set(self.best_shift())
+        msg = self.adapt()
+        notes = sorted(n for e in self.events for n in e['notes'])
         self.octave.set(max(1, min(6, notes[len(notes) // 2] // 12 - 1)))
+        self.restart()
+        self.status.set(f'{len(events)} étapes — tempo {self.get_tempo()} BPM. {msg} '
+                        f'Appuie sur Lecture (ou Espace).')
+
+    # ---- adaptation au clavier
+    def kb_range(self):
+        return KEYBOARDS.get(self.kb_choice.get(), (36, 96))
+
+    def get_shift(self):
+        try:
+            return max(-4, min(4, int(self.shift.get())))
+        except (tk.TclError, ValueError):
+            return 0
+
+    def best_shift(self):
+        """Décalage en octaves qui laisse le moins de notes hors du clavier (puis le plus petit)."""
+        lo, hi = self.kb_range()
+        best = None
+        for sh in range(-4, 5):
+            out = sum(1 for e in self.src_events for n in e['notes'] if not lo <= n + 12 * sh <= hi)
+            key = (out, abs(sh))
+            if best is None or key < best[0]:
+                best = (key, sh)
+        return best[1] if best else 0
+
+    def adapt(self):
+        """Transpose le morceau (en octaves) puis ramène dans le clavier les notes qui dépassent encore."""
+        lo, hi = self.kb_range()
+        self.range = (lo, hi)
+        shift = self.get_shift()
+        folded = 0
+        events = []
+        for e in self.src_events:
+            notes = {}
+            for n, (dur, staff) in e['notes'].items():
+                m = n + 12 * shift
+                if not lo <= m <= hi:
+                    folded += 1
+                    while m < lo:
+                        m += 12
+                    while m > hi:
+                        m -= 12
+                old = notes.get(m)
+                notes[m] = (max(dur, old[0]) if old else dur, staff)
+            events.append({'beat': e['beat'], 'notes': notes})
+        self.events = events
+        self._shown = None
         self.listbox.delete(0, 'end')
         for i, e in enumerate(events):
             self.listbox.insert('end', f'{i + 1:>4}   ' + '  +  '.join(note_name(n) for n in sorted(e['notes'])))
-        self.restart()
-        self.status.set(f'{len(events)} étapes chargées — tempo {self.get_tempo()} BPM. '
-                        f'Appuie sur Lecture (ou Espace).')
+        if self.mic:
+            self.mic.set_range(lo, hi)
+        keys = self.kb_choice.get().split(' (')[0]
+        bits = []
+        if shift:
+            bits.append(f'transposé de {shift:+d} octave(s)')
+        if folded:
+            bits.append(f'{folded} note(s) ramenée(s) dans ta tessiture')
+        return f'Clavier {keys} : ' + (', '.join(bits) if bits else 'le morceau tient tel quel') + '.'
+
+    def on_kb_change(self):
+        if not self.src_events:
+            return
+        self.shift.set(self.best_shift())
+        self.status.set(self.adapt())
+
+    def on_shift_change(self):
+        if self.src_events:
+            self.status.set(self.adapt())
+        self.canvas.focus_set()
+
+    def on_auto_shift(self):
+        if self.src_events:
+            self.shift.set(self.best_shift())
+            self.status.set(self.adapt())
+        self.canvas.focus_set()
 
     def restart(self):
         self.playing = self.waiting = False
+        self.partial_since = None
         self.idx = 0
         self.pos = (self.events[0]['beat'] - 3) if self.events else 0.0
         self.recent.clear()
@@ -571,12 +853,33 @@ class PianoTrainer(tk.Tk):
         self.toggle()
         return 'break'
 
+    def on_skip_key(self, event):
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox)):
+            return
+        self.skip()
+        return 'break'
+
+    def skip(self):
+        """Dernier recours : saute l'étape en cours (si une note ne veut vraiment pas être reconnue)."""
+        if not (self.events and self.idx < len(self.events)):
+            return
+        if self.mic:
+            self.mic.consume(list(self.events[self.idx]['notes']))
+        for n in self.events[self.idx]['notes']:
+            self.recent.pop(n, None)
+        self.idx += 1
+        self.waiting = False
+        self.partial_since = None
+        self.status.set('Étape passée ⏭')
+        self.canvas.focus_set()
+
     def on_list_jump(self, _event):
         sel = self.listbox.curselection()
         if sel and self.events:
             self.idx = sel[0]
             self.pos = self.events[self.idx]['beat'] - 1
             self.waiting = False
+            self.partial_since = None
 
     def get_tempo(self):
         try:
@@ -637,20 +940,45 @@ class PianoTrainer(tk.Tk):
                 self.status.set('Essaie encore : ' + ' + '.join(note_name(x) for x in sorted(required)))
             self.check_wait()
 
+    def needed(self, count):
+        """Nombre de notes d'une étape à reconnaître pour continuer, selon la tolérance choisie."""
+        mode = TOLERANCES.get(self.tol_choice.get(), 0)
+        if mode == 1:
+            return count - 1 if count >= 3 else count
+        if mode == 2:
+            return max(1, math.ceil(count / 2))
+        return count
+
     def check_wait(self):
         if not (self.playing and self.waiting and self.idx < len(self.events)):
             return
+        now = time.perf_counter()
         required = list(self.events[self.idx]['notes'])
-        times = [self.recent.get(n) for n in required]
-        if None in times:
+        got = {n: self.recent[n] for n in required
+               if self.recent.get(n) is not None and self.recent[n] >= self.wait_start - 0.5}
+        if got:                                       # notes jouées « en même temps » (fenêtre d'accord)
+            newest = max(got.values())
+            got = {n: t for n, t in got.items() if newest - t <= CHORD_WINDOW}
+        if len(got) < self.needed(len(required)):
+            self.partial_since = None
             return
-        if min(times) < self.wait_start - 0.2 or max(times) - min(times) > CHORD_WINDOW:
-            return
+        if len(got) < len(required):                  # assez de notes, mais pas toutes : petit délai de grâce
+            if self.partial_since is None:
+                self.partial_since = now
+            if now - self.partial_since < PARTIAL_GRACE:
+                return
         for n in required:
             self.recent.pop(n, None)
+        if self.mic:
+            self.mic.consume(required)       # la frappe est « utilisée » : elle ne validera pas la note suivante
         self.idx += 1
         self.waiting = False
-        self.status.set('Bien joué ✔')
+        self.partial_since = None
+        if len(got) == len(required):
+            self.status.set('Bien joué ✔')
+        else:
+            missing = ' + '.join(note_name(n) for n in sorted(set(required) - set(got)))
+            self.status.set(f'OK ✔ ({len(got)}/{len(required)} notes reconnues — non entendue : {missing})')
 
     # ---- boucle principale
     def tick(self):
@@ -662,6 +990,8 @@ class PianoTrainer(tk.Tk):
             self.poll_midi()
             self.process_mic(now)
             if self.playing:
+                if self.waiting and self.partial_since is not None:
+                    self.check_wait()                   # laisse finir le délai de grâce
                 if self.waiting and not self.wait_mode.get():
                     self.waiting = False
                 if not self.waiting:
@@ -671,6 +1001,7 @@ class PianoTrainer(tk.Tk):
                         if self.wait_mode.get():
                             self.pos = ev['beat']
                             self.waiting = True
+                            self.partial_since = None
                             self.wait_start = now
                             self.check_wait()
                             break
@@ -814,7 +1145,10 @@ class PianoTrainer(tk.Tk):
 
         if self.mic_on.get() and self.mic and self.mic.stream:
             level = min(1.0, self.mic.level * 15)
-            c.create_text(w - 150, 14, text='🎤', fill='#c9cee0', font=('Arial', 11))
+            heard_txt = ' '.join(note_name(n) for n in sorted(self.mic_present)[:6]) or '…'
+            c.create_text(10, 14, text='🎤 J’entends : ' + heard_txt, fill='#9fd8ff', anchor='w',
+                          font=('Arial', 11, 'bold'))
+            c.create_text(w - 150, 14, text='niveau', fill='#c9cee0', font=('Arial', 9))
             c.create_rectangle(w - 135, 8, w - 15, 20, outline='#69708a')
             c.create_rectangle(w - 135, 8, w - 135 + 120 * level, 20, fill='#5fe08a' if level < 0.9 else '#ff6b6b',
                                outline='')
